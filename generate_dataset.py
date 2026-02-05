@@ -57,7 +57,7 @@ python generate_dataset.py \
                        help='Path to KataHex executable (default: bin/katahex)')
     parser.add_argument('--model', default='katahex_model_20220618.bin.gz',
                        help='Path to neural network model (default: katahex_model_20220618.bin.gz)')
-    parser.add_argument('--config', default='processing_config.cfg',
+    parser.add_argument('--config', default='processor_config.cfg',
                        help='Path to config file (default: processing_config.cfg)')
     parser.add_argument('--threads', '-t', type=int, default=1,
                        help='Number of parallel threads for game processing (default: 1)')

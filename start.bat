@@ -10,7 +10,7 @@ echo This will generate games with varied playing styles for rich training data.
 echo.
 
 REM Run with random diversity mode for maximum variety
-python generate_rollouts.py --diversity-mode random --num-games 40 --num-threads 4
+python generate_rollouts.py --diversity-mode random --num-games 40 --num-threads 4 --num-gpus 8
 
 echo.
 echo ========================================

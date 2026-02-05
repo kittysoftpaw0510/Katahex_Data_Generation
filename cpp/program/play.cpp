@@ -1377,6 +1377,39 @@ FinishedGameData* Play::runGame(
       loc = runBotWithLimits(toMoveBot, pla, playSettings, limits);
     }
 
+    // ANTI-PASS FIX: If the bot chose to pass, force it to play a real move instead
+    // This is needed because the neural network was trained with jump connections enabled,
+    // so it incorrectly evaluates positions and wants to pass when it thinks it's losing
+    if(loc == Board::PASS_LOC) {
+      // Get all legal moves with their visit counts from the search tree
+      vector<Loc> locs;
+      vector<double> playSelectionValues;
+      vector<double> visitCounts;
+      bool suc = toMoveBot->getPlaySelectionValues(
+        locs, playSelectionValues, &visitCounts, 0.0
+      );
+
+      // Find the best non-pass move
+      if(suc && locs.size() > 0) {
+        int bestNonPassIdx = -1;
+        double bestNonPassVisits = -1.0;
+        for(int i = 0; i < locs.size(); i++) {
+          if(locs[i] != Board::PASS_LOC && visitCounts[i] > bestNonPassVisits) {
+            bestNonPassIdx = i;
+            bestNonPassVisits = visitCounts[i];
+          }
+        }
+
+        // If we found a non-pass move, use it instead
+        if(bestNonPassIdx >= 0) {
+          loc = locs[bestNonPassIdx];
+          if(logMoves) {
+            logger.write("WARNING: Bot wanted to pass, forced to play " + Location::toString(loc,board) + " instead");
+          }
+        }
+      }
+    }
+
     if(pla == P_BLACK)
       gameData->bMoveCount += 1;
     else
