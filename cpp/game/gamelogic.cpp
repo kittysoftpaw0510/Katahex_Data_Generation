@@ -311,9 +311,7 @@ Color GameLogic::checkWinnerAfterPlayed(
   Player pla,
   Loc loc,
   int8_t* bufferForCheckingWinner) {
-  // DISABLED: Jump connections are non-standard Hex rules
-  // Only allow proper edge-to-edge connections
-  bool includeJumpConnection = false;  // Changed from: hist.rules.maxMoves == 0
+  bool includeJumpConnection = hist.rules.maxMoves == 0;
   if(board.checkConnection(bufferForCheckingWinner, pla, includeJumpConnection))
     return pla;
 
