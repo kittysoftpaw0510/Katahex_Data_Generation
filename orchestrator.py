@@ -26,35 +26,41 @@ class SGFSProcessor:
     def __init__(self,
                  katahex_path: str = "build/katahex-win64-19-eigen.exe",
                  model_path: str = "katahex_model_20220618.bin.gz",
-                 config_path: Optional[str] = None):
+                 config_path: Optional[str] = None,
+                 use_mcts: bool = False):
         """
         Initialize the processor.
-        
+
         Args:
             katahex_path: Path to KataHex executable
             model_path: Path to neural network model
             config_path: Optional path to config file
+            use_mcts: If True, use MCTS search (slow, high quality). If False, use raw NN (fast)
         """
         self.katahex_path = katahex_path
         self.model_path = model_path
         self.config_path = config_path
+        self.use_mcts = use_mcts
     
     def process_sgfs_file(self,
                          sgfs_path: str,
                          output_dir: str,
                          max_games: Optional[int] = None,
-                         num_threads: int = 1) -> List[GameData]:
+                         num_threads: int = 1,
+                         num_gpus: int = 1) -> int:
         """
         Process an SGFS file and generate conversation data.
+        MULTI-GPU VERSION: Can use multiple GPUs for parallel processing.
 
         Args:
             sgfs_path: Path to the .sgfs file
             output_dir: Directory to save conversation JSONL files
             max_games: Optional limit on number of games to process
-            num_threads: Number of threads for conversation generation
+            num_threads: Number of parallel game processing threads (should match num_gpus for best performance)
+            num_gpus: Number of GPUs to use (default: 1)
 
         Returns:
-            List of GameData objects
+            Number of games processed
         """
         print(f"Step 1: Parsing SGFS file: {sgfs_path}")
         games = parse_sgfs_file(sgfs_path)
@@ -64,25 +70,141 @@ class SGFSProcessor:
             games = games[:max_games]
             print(f"Processing first {max_games} games")
 
-        print(f"\nStep 2: Starting neural network evaluator...")
+        os.makedirs(output_dir, exist_ok=True)
+
+        if num_gpus > 1 and num_threads > 1:
+            # Multi-GPU parallel processing
+            return self._process_multi_gpu(games, output_dir, num_threads, num_gpus)
+        else:
+            # Single GPU sequential processing
+            return self._process_single_gpu(games, output_dir)
+
+    def _process_single_gpu(self, games: list, output_dir: str) -> int:
+        """Process games sequentially on a single GPU."""
+        print(f"\nStep 2: Starting neural network evaluator (Single GPU)...")
+        print(f"Mode: {'MCTS search (slow, high quality)' if self.use_mcts else 'Raw NN (fast)'}")
+
         with KataHexEvaluator(
             katahex_path=self.katahex_path,
             model_path=self.model_path,
-            config_path=self.config_path
+            config_path=self.config_path,
+            use_mcts=self.use_mcts
         ) as evaluator:
             print("Evaluator started successfully")
 
-            print(f"\nStep 3: Processing games...")
+            print(f"\nStep 3: Processing games (streaming mode - low memory usage)...")
             processor = GameHistoryProcessor(evaluator)
-            results = processor.process_games(games)
 
-        print(f"\nStep 4: Processing complete!")
-        print(f"Successfully processed {len(results)} games")
+            games_processed = 0
+            start_time = time.time()
 
-        print(f"\nStep 5: Generating conversations and saving to {output_dir}")
-        self.save_conversations(results, output_dir, num_threads=num_threads)
+            for idx, game in enumerate(games, 1):
+                try:
+                    # Process single game
+                    game_data = processor.process_game(game)
 
-        return results
+                    # Immediately save conversation (don't accumulate in memory)
+                    self._save_single_conversation(
+                        game_data, output_dir,
+                        include_policy=True,
+                        include_value=True
+                    )
+
+                    games_processed += 1
+
+                    # Progress update
+                    if idx % 10 == 0 or idx == len(games):
+                        elapsed = time.time() - start_time
+                        rate = games_processed / elapsed if elapsed > 0 else 0
+                        eta = (len(games) - idx) / rate if rate > 0 else 0
+                        print(f"Progress: {idx}/{len(games)} games | "
+                              f"Rate: {rate:.2f} games/sec | "
+                              f"ETA: {eta/60:.1f} min")
+
+                except Exception as e:
+                    print(f"Error processing game {idx}: {e}")
+                    continue
+
+        print(f"\nProcessing complete!")
+        print(f"Successfully processed {games_processed} games")
+        print(f"Output directory: {output_dir}")
+
+        return games_processed
+
+    def _process_multi_gpu(self, games: list, output_dir: str, num_threads: int, num_gpus: int) -> int:
+        """Process games in parallel using multiple GPUs."""
+        print(f"\nStep 2: Starting {num_gpus} GPU workers with {num_threads} threads...")
+        print(f"Mode: {'MCTS search (slow, high quality)' if self.use_mcts else 'Raw NN (fast)'}")
+
+        games_processed = 0
+        games_lock = Lock()
+        start_time = time.time()
+
+        def process_game_worker(game_idx_tuple):
+            """Worker function for parallel processing."""
+            idx, game = game_idx_tuple
+            gpu_id = idx % num_gpus  # Assign GPU based on game index
+
+            try:
+                # Create evaluator with specific GPU
+                with KataHexEvaluator(
+                    katahex_path=self.katahex_path,
+                    model_path=self.model_path,
+                    config_path=self.config_path,
+                    use_mcts=self.use_mcts,
+                    gpu_id=gpu_id
+                ) as evaluator:
+                    processor = GameHistoryProcessor(evaluator)
+                    game_data = processor.process_game(game)
+
+                    # Save conversation (thread-safe)
+                    self._save_single_conversation(
+                        game_data, output_dir,
+                        include_policy=True,
+                        include_value=True
+                    )
+
+                    # Update progress (thread-safe)
+                    nonlocal games_processed
+                    with games_lock:
+                        games_processed += 1
+                        current_count = games_processed
+
+                    # Progress update
+                    if current_count % 10 == 0 or current_count == len(games):
+                        elapsed = time.time() - start_time
+                        rate = current_count / elapsed if elapsed > 0 else 0
+                        eta = (len(games) - current_count) / rate if rate > 0 else 0
+                        print(f"Progress: {current_count}/{len(games)} games | "
+                              f"Rate: {rate:.2f} games/sec | "
+                              f"ETA: {eta/60:.1f} min | "
+                              f"GPU {gpu_id}")
+
+                    return True
+
+            except Exception as e:
+                print(f"Error processing game {idx} on GPU {gpu_id}: {e}")
+                return False
+
+        print(f"\nStep 3: Processing {len(games)} games in parallel across {num_gpus} GPUs...")
+
+        # Process games in parallel
+        with ThreadPoolExecutor(max_workers=num_threads) as executor:
+            # Submit all games
+            futures = []
+            for idx, game in enumerate(games, 1):
+                future = executor.submit(process_game_worker, (idx, game))
+                futures.append(future)
+
+            # Wait for all to complete
+            for future in as_completed(futures):
+                future.result()  # This will raise any exceptions that occurred
+
+        print(f"\nProcessing complete!")
+        print(f"Successfully processed {games_processed} games")
+        print(f"Output directory: {output_dir}")
+
+        return games_processed
 
     def _save_checkpoint(self, results: List[GameData], checkpoint_path: str):
         """

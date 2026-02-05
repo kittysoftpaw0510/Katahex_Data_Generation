@@ -38,21 +38,27 @@ class KataHexEvaluator:
     Interface to KataHex neural network evaluation via GTP protocol.
     """
     
-    def __init__(self, 
+    def __init__(self,
                  katahex_path: str = "build/katahex-win64-19-eigen.exe",
                  model_path: str = "katahex_model_20220618.bin.gz",
-                 config_path: Optional[str] = None):
+                 config_path: Optional[str] = None,
+                 use_mcts: bool = False,
+                 gpu_id: Optional[int] = None):
         """
         Initialize the evaluator.
-        
+
         Args:
             katahex_path: Path to KataHex executable
             model_path: Path to neural network model
             config_path: Optional path to config file
+            use_mcts: If True, use kata-analyze (slow, high quality). If False, use kata-raw-nn (fast, raw NN)
+            gpu_id: Optional GPU ID to use (for multi-GPU setups)
         """
         self.katahex_path = katahex_path
         self.model_path = model_path
         self.config_path = config_path
+        self.use_mcts = use_mcts
+        self.gpu_id = gpu_id
         self.process = None
         
     def start(self):
@@ -64,6 +70,14 @@ class KataHexEvaluator:
             cmd.extend(["-config", self.config_path])
         if self.model_path:
             cmd.extend(["-model", self.model_path])
+
+        # GPU selection via command-line override
+        # This overrides the config file settings
+        if self.gpu_id is not None:
+            # For CUDA backend
+            cmd.extend(["-override-config", f"cudaDeviceToUse={self.gpu_id}"])
+            # For OpenCL backend
+            cmd.extend(["-override-config", f"openclDeviceToUse={self.gpu_id}"])
 
         # Use universal_newlines=True for text mode
         self.process = subprocess.Popen(
@@ -186,7 +200,7 @@ class KataHexEvaluator:
     
     def evaluate(self, board_state: BoardState) -> NNEvaluation:
         """
-        Evaluate a board position using the neural network.
+        Evaluate a board position using neural network.
 
         Args:
             board_state: The board state to evaluate
@@ -197,22 +211,18 @@ class KataHexEvaluator:
         # Set up the position
         self.set_position(board_state)
 
+        if self.use_mcts:
+            return self._evaluate_with_mcts(board_state)
+        else:
+            return self._evaluate_raw_nn(board_state)
+
+    def _evaluate_raw_nn(self, board_state: BoardState) -> NNEvaluation:
+        """Fast evaluation using raw NN (no MCTS)."""
         # Get raw neural network output using kata-raw-nn command
         # Symmetry 0 means no symmetry transformation
         response = self._send_command("kata-raw-nn 0")
 
         # Parse the response
-        # Expected format from kata-raw-nn:
-        # symmetry 0
-        # whiteWin 0.520000
-        # whiteLoss 0.480000
-        # noResult 0.000000
-        # varTimeLeft 12.345
-        # shorttermWinlossError 0.123
-        # policy
-        # <grid of probabilities, one row per board row>
-        # policyPass <probability>
-
         policy = {}
         win_prob = 0.5
         loss_prob = 0.5
@@ -241,19 +251,14 @@ class KataHexEvaluator:
                 in_policy_section = True
                 policy_row = 0
             elif parts[0] == 'policyPass':
-                # Pass move probability
                 if len(parts) > 1 and parts[1] != 'NAN':
                     policy['pass'] = float(parts[1])
                 in_policy_section = False
             elif in_policy_section:
                 # This is a row of the policy grid
-                # Convert grid position to Hex coordinates
                 for col, prob_str in enumerate(parts):
                     if prob_str != 'NAN':
                         prob = float(prob_str)
-                        # Convert (col, row) to Hex notation (e.g., 'e4')
-                        # Columns are labeled a, b, c, ...
-                        # Rows are labeled 1, 2, 3, ...
                         col_letter = chr(ord('a') + col)
                         row_number = policy_row + 1
                         location = f"{col_letter}{row_number}"
@@ -261,11 +266,80 @@ class KataHexEvaluator:
                 policy_row += 1
 
         # Calculate value from current player's perspective
-        # KataHex outputs are from White's perspective:
-        #   whiteWin = probability White wins
-        #   whiteLoss = probability White loses (Black wins)
-        # If next player is Black: value = whiteLoss - whiteWin (positive when Black winning)
-        # If next player is White: value = whiteWin - whiteLoss (positive when White winning)
+        if board_state.next_player == 'B':
+            value = loss_prob - win_prob  # Black's perspective
+        else:
+            value = win_prob - loss_prob  # White's perspective
+
+        return NNEvaluation(
+            policy=policy,
+            value=value,
+            win_prob=win_prob,
+            loss_prob=loss_prob,
+            draw_prob=draw_prob
+        )
+
+    def _evaluate_with_mcts(self, board_state: BoardState) -> NNEvaluation:
+        """High-quality evaluation using MCTS search (slow)."""
+        # Use kata-analyze to get MCTS-refined evaluation
+        # This respects the maxVisits setting in the config file
+        response = self._send_command("kata-analyze maxmoves 361")
+
+        policy = {}
+        win_prob = 0.5
+        loss_prob = 0.5
+        draw_prob = 0.0
+
+        lines = response.strip().split('\n')
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+
+            # Parse move information
+            if parts[0] == 'info' and parts[1] == 'move':
+                move = None
+                prior = 0.0
+
+                i = 2
+                while i < len(parts):
+                    if parts[i] == 'prior' and i + 1 < len(parts):
+                        prior = float(parts[i + 1])
+                        i += 2
+                    elif move is None:
+                        move = parts[i]
+                        i += 1
+                    else:
+                        i += 1
+
+                if move and move.lower() != 'pass':
+                    policy[move.lower()] = prior
+
+            # Parse root information for overall winrate
+            elif parts[0] == 'rootInfo':
+                i = 1
+                while i < len(parts):
+                    if parts[i] == 'winrate' and i + 1 < len(parts):
+                        current_player_winrate = float(parts[i + 1])
+
+                        # Convert to White's perspective for consistency
+                        if board_state.next_player == 'B':
+                            win_prob = 1.0 - current_player_winrate
+                            loss_prob = current_player_winrate
+                        else:
+                            win_prob = current_player_winrate
+                            loss_prob = 1.0 - current_player_winrate
+
+                        i += 2
+                    else:
+                        i += 1
+
+        # Calculate value from current player's perspective
         if board_state.next_player == 'B':
             value = loss_prob - win_prob  # Black's perspective
         else:

@@ -188,7 +188,7 @@ def example_6_conversation_generation():
     print("=" * 70)
 
     processor = SGFSProcessor(
-        katahex_path="build/katahex-win64-19-eigen.exe",
+        katahex_path="bin/katahex",
         model_path="katahex_model_20220618.bin.gz",
         config_path="processor_gtp.cfg"
     )

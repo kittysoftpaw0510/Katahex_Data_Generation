@@ -31,12 +31,21 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Process all SGFS files in a directory
-  python generate_dataset.py --input sgfs_dir --output dataset_dir
+# Fast mode (default) - uses raw NN evaluation
+python generate_dataset.py --input sgfs_dir --output dataset_dir --num-gpus 8 --threads 8
 
-  # With custom KataHex settings and multi-threading
-  python generate_dataset.py --input sgfs_dir --output dataset_dir \\
-      --katahex build/katahex.exe --model model.bin.gz --threads 4
+# Quality mode - uses MCTS search (slower but better quality)
+python generate_dataset.py --input sgfs_dir --output dataset_dir --num-gpus 8 --threads 8 --use-mcts
+
+# With custom KataHex path and model
+python generate_dataset.py \
+  --input sgfs_dir \
+  --output dataset_dir \
+  --num-gpus 8 \
+  --threads 8 \
+  --katahex build/katahex-win64-19-eigen.exe \
+  --model katahex_model_20220618.bin.gz \
+  --config processor_gtp.cfg
         """
     )
 
@@ -51,7 +60,11 @@ Examples:
     parser.add_argument('--config', default='processing_config.cfg',
                        help='Path to config file (default: processing_config.cfg)')
     parser.add_argument('--threads', '-t', type=int, default=1,
-                       help='Number of parallel threads for conversation generation (default: 1)')
+                       help='Number of parallel threads for game processing (default: 1)')
+    parser.add_argument('--num-gpus', '-g', type=int, default=1,
+                       help='Number of GPUs to use for parallel processing (default: 1)')
+    parser.add_argument('--use-mcts', action='store_true',
+                       help='Use MCTS search for evaluation (slow but high quality). Default: raw NN (fast)')
 
     args = parser.parse_args()
 
@@ -70,12 +83,23 @@ Examples:
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"Output directory: {output_dir}\n")
 
+    # Validate GPU/thread configuration
+    if args.num_gpus > 1 and args.threads < args.num_gpus:
+        print(f"WARNING: Using {args.num_gpus} GPUs but only {args.threads} threads.")
+        print(f"         Recommend setting --threads >= --num-gpus for best performance.")
+        print(f"         Auto-adjusting threads to {args.num_gpus}")
+        args.threads = args.num_gpus
+
     # Create processor
     processor = SGFSProcessor(
         katahex_path=args.katahex,
         model_path=args.model,
-        config_path=args.config
+        config_path=args.config,
+        use_mcts=args.use_mcts
     )
+
+    print(f"Evaluation mode: {'MCTS search (slow, high quality)' if args.use_mcts else 'Raw NN (fast)'}")
+    print(f"GPU configuration: {args.num_gpus} GPU(s), {args.threads} thread(s)")
 
     # Process all SGFS files
     total_games = 0
@@ -91,7 +115,8 @@ Examples:
             processor.process_sgfs_file(
                 sgfs_path=str(sgfs_file),
                 output_dir=str(file_output_dir),
-                num_threads=args.threads
+                num_threads=args.threads,
+                num_gpus=args.num_gpus
             )
 
             # Count generated files
