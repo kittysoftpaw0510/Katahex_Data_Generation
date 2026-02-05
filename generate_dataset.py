@@ -27,22 +27,22 @@ def find_sgfs_files(input_dir: str) -> List[Path]:
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Generate conversation datasets from SGFS files',
+        description='Generate conversation datasets from SGFS files (multiprocessing)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
 # Fast mode (default) - uses raw NN evaluation
-python generate_dataset.py --input sgfs_dir --output dataset_dir --num-gpus 8 --threads 8
+python generate_dataset.py --input sgfs_dir --output dataset_dir --num-gpus 8 --processes 8
 
 # Quality mode - uses MCTS search (slower but better quality)
-python generate_dataset.py --input sgfs_dir --output dataset_dir --num-gpus 8 --threads 8 --use-mcts
+python generate_dataset.py --input sgfs_dir --output dataset_dir --num-gpus 8 --processes 8 --use-mcts
 
 # With custom KataHex path and model
 python generate_dataset.py \
   --input rollouts_output \
   --output out_processed \
   --num-gpus 8 \
-  --threads 8 \
+  --processes 24 \
   --use-mcts \
   --max-visits 500 \
   --katahex bin/katahex \
@@ -60,8 +60,8 @@ python generate_dataset.py \
                        help='Path to neural network model (default: katahex_model_20220618.bin.gz)')
     parser.add_argument('--config', default='processor_config.cfg',
                        help='Path to config file (default: processing_config.cfg)')
-    parser.add_argument('--threads', '-t', type=int, default=1,
-                       help='Number of parallel threads for game processing (default: 1)')
+    parser.add_argument('--processes', '-p', type=int, default=1,
+                       help='Number of parallel worker processes (default: 1)')
     parser.add_argument('--num-gpus', '-g', type=int, default=1,
                        help='Number of GPUs to use for parallel processing (default: 1)')
     parser.add_argument('--use-mcts', action='store_true',
@@ -86,12 +86,12 @@ python generate_dataset.py \
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"Output directory: {output_dir}\n")
 
-    # Validate GPU/thread configuration
-    if args.num_gpus > 1 and args.threads < args.num_gpus:
-        print(f"WARNING: Using {args.num_gpus} GPUs but only {args.threads} threads.")
-        print(f"         Recommend setting --threads >= --num-gpus for best performance.")
-        print(f"         Auto-adjusting threads to {args.num_gpus}")
-        args.threads = args.num_gpus
+    # Validate GPU/process configuration
+    if args.num_gpus > 1 and args.processes < args.num_gpus:
+        print(f"WARNING: Using {args.num_gpus} GPUs but only {args.processes} processes.")
+        print(f"         Recommend setting --processes >= --num-gpus for best performance.")
+        print(f"         Auto-adjusting processes to {args.num_gpus}")
+        args.processes = args.num_gpus
 
     # Create processor
     processor = SGFSProcessor(
@@ -103,74 +103,37 @@ python generate_dataset.py \
     )
 
     print(f"Evaluation mode: {'MCTS search (slow, high quality)' if args.use_mcts else 'Raw NN (fast)'}")
-    print(f"GPU configuration: {args.num_gpus} GPU(s), {args.threads} thread(s)")
+    print(f"GPU configuration: {args.num_gpus} GPU(s), {args.processes} process(es)")
+    print(f"\nProcessing {len(sgfs_files)} SGFS files...")
 
-    # Check if we should use batch mode for better GPU utilization
-    use_batch_mode = args.num_gpus > 1
-
-    if use_batch_mode:
-        # BATCH MODE: Aggregate all games from all files for better GPU utilization
+    # Process each file with the unified multiprocessing architecture
+    # The new orchestrator automatically handles multi-GPU distribution
+    total_games = 0
+    for idx, sgfs_file in enumerate(sgfs_files, 1):
         print(f"\n{'='*60}")
-        print(f"BATCH MODE: Processing all {len(sgfs_files)} files together")
-        print(f"This ensures all {args.num_gpus} GPUs are fully utilized")
-        print(f"{'='*60}\n")
+        print(f"Processing file {idx}/{len(sgfs_files)}: {sgfs_file.name}")
+        print(f"{'='*60}")
 
-        from sgf_parser import parse_sgfs_file
+        # Create subdirectory for this file's output
+        file_output_dir = output_dir / sgfs_file.stem
 
-        # Collect all games from all files
-        all_games = []
-        file_mapping = {}  # Track which file each game came from
+        try:
+            processor.process_sgfs_file(
+                sgfs_path=str(sgfs_file),
+                output_dir=str(file_output_dir),
+                num_processes=args.processes,
+                num_gpus=args.num_gpus
+            )
 
-        for sgfs_file in sgfs_files:
-            print(f"Loading: {sgfs_file.name}")
-            games = parse_sgfs_file(str(sgfs_file))
-            for game in games:
-                file_mapping[id(game)] = sgfs_file.stem
-                all_games.append(game)
+            # Count generated files
+            if file_output_dir.exists():
+                game_files = list(file_output_dir.glob("*.jsonl"))
+                total_games += len(game_files)
+                print(f"Generated {len(game_files)} conversation files")
 
-        print(f"\nTotal games loaded: {len(all_games)}")
-        print(f"Processing all games across {args.num_gpus} GPUs...\n")
-
-        # Process all games together
-        processor._process_multi_gpu_with_file_mapping(
-            all_games,
-            str(output_dir),
-            file_mapping,
-            args.threads,
-            args.num_gpus
-        )
-
-        # Count total generated files
-        total_games = len(list(output_dir.rglob("*.jsonl")))
-
-    else:
-        # SEQUENTIAL MODE: Process each file separately (single GPU)
-        total_games = 0
-        for idx, sgfs_file in enumerate(sgfs_files, 1):
-            print(f"\n{'='*60}")
-            print(f"Processing file {idx}/{len(sgfs_files)}: {sgfs_file.name}")
-            print(f"{'='*60}")
-
-            # Create subdirectory for this file's output
-            file_output_dir = output_dir / sgfs_file.stem
-
-            try:
-                processor.process_sgfs_file(
-                    sgfs_path=str(sgfs_file),
-                    output_dir=str(file_output_dir),
-                    num_threads=args.threads,
-                    num_gpus=args.num_gpus
-                )
-
-                # Count generated files
-                if file_output_dir.exists():
-                    game_files = list(file_output_dir.glob("*.jsonl"))
-                    total_games += len(game_files)
-                    print(f"Generated {len(game_files)} conversation files")
-
-            except Exception as e:
-                print(f"Error processing {sgfs_file.name}: {e}")
-                continue
+        except Exception as e:
+            print(f"Error processing {sgfs_file.name}: {e}")
+            continue
 
     print(f"\n{'='*60}")
     print(f"Dataset generation complete!")
