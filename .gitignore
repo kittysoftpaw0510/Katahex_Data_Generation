@@ -1,0 +1,7 @@
+bin
+build
+rollouts_output
+lib
+__pycache__
+katahex_model_20220618.bin.gz
+dataset_100000

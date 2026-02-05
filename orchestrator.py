@@ -1,0 +1,377 @@
+#!/usr/bin/env python3
+"""
+Module 4: Orchestrator
+Main orchestration module that ties everything together.
+"""
+
+import json
+import argparse
+import os
+from pathlib import Path
+from typing import List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
+import time
+from sgf_parser import parse_sgfs_file
+from nn_evaluator import KataHexEvaluator
+from game_processor import GameHistoryProcessor, GameData
+from conversation_generator import generate_conversation_from_game
+
+
+class SGFSProcessor:
+    """
+    Main orchestrator for processing SGFS files with neural network evaluation.
+    """
+    
+    def __init__(self,
+                 katahex_path: str = "build/katahex-win64-19-eigen.exe",
+                 model_path: str = "katahex_model_20220618.bin.gz",
+                 config_path: Optional[str] = None):
+        """
+        Initialize the processor.
+        
+        Args:
+            katahex_path: Path to KataHex executable
+            model_path: Path to neural network model
+            config_path: Optional path to config file
+        """
+        self.katahex_path = katahex_path
+        self.model_path = model_path
+        self.config_path = config_path
+    
+    def process_sgfs_file(self,
+                         sgfs_path: str,
+                         output_dir: str,
+                         max_games: Optional[int] = None,
+                         num_threads: int = 1) -> List[GameData]:
+        """
+        Process an SGFS file and generate conversation data.
+
+        Args:
+            sgfs_path: Path to the .sgfs file
+            output_dir: Directory to save conversation JSONL files
+            max_games: Optional limit on number of games to process
+            num_threads: Number of threads for conversation generation
+
+        Returns:
+            List of GameData objects
+        """
+        print(f"Step 1: Parsing SGFS file: {sgfs_path}")
+        games = parse_sgfs_file(sgfs_path)
+        print(f"Found {len(games)} games")
+
+        if max_games:
+            games = games[:max_games]
+            print(f"Processing first {max_games} games")
+
+        print(f"\nStep 2: Starting neural network evaluator...")
+        with KataHexEvaluator(
+            katahex_path=self.katahex_path,
+            model_path=self.model_path,
+            config_path=self.config_path
+        ) as evaluator:
+            print("Evaluator started successfully")
+
+            print(f"\nStep 3: Processing games...")
+            processor = GameHistoryProcessor(evaluator)
+            results = processor.process_games(games)
+
+        print(f"\nStep 4: Processing complete!")
+        print(f"Successfully processed {len(results)} games")
+
+        print(f"\nStep 5: Generating conversations and saving to {output_dir}")
+        self.save_conversations(results, output_dir, num_threads=num_threads)
+
+        return results
+
+    def _save_checkpoint(self, results: List[GameData], checkpoint_path: str):
+        """
+        Save checkpoint in JSONL format.
+
+        Args:
+            results: List of GameData objects
+            checkpoint_path: Path to checkpoint file
+        """
+        os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+        with open(checkpoint_path, 'w', encoding='utf-8') as f:
+            for game in results:
+                json.dump(game.to_dict(), f)
+                f.write('\n')
+
+    def save_conversations(self,
+                          results: List[GameData],
+                          output_dir: str,
+                          include_policy: bool = True,
+                          include_value: bool = True,
+                          num_threads: int = 1):
+        """
+        Save conversation data to output directory (one file per game).
+        Each file contains one conversation per line (step).
+
+        Args:
+            results: List of GameData objects
+            output_dir: Directory to save conversation files
+            include_policy: Include top policy moves in output
+            include_value: Include value estimates in output
+            num_threads: Number of threads for parallel processing (default: 1)
+        """
+        os.makedirs(output_dir, exist_ok=True)
+
+        if num_threads <= 1:
+            # Sequential processing
+            for game in results:
+                self._save_single_conversation(game, output_dir, include_policy, include_value)
+        else:
+            # Multi-threaded processing
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            with ThreadPoolExecutor(max_workers=num_threads) as executor:
+                futures = []
+                for game in results:
+                    future = executor.submit(
+                        self._save_single_conversation,
+                        game, output_dir, include_policy, include_value
+                    )
+                    futures.append(future)
+
+                # Wait for all to complete
+                completed = 0
+                for future in as_completed(futures):
+                    completed += 1
+                    if completed % 10 == 0 or completed == len(futures):
+                        print(f"Progress: {completed}/{len(futures)} conversations generated")
+
+        print(f"Saved {len(results)} game conversation files to {output_dir}")
+
+    def _save_single_conversation(self, game: GameData, output_dir: str,
+                                  include_policy: bool, include_value: bool):
+        """Helper method to save a single game's conversation."""
+        game_id = game.game_id or f"game_{id(game)}"
+        output_path = os.path.join(output_dir, f"{game_id}.jsonl")
+
+        conversations = generate_conversation_from_game(
+            game,
+            include_policy=include_policy,
+            include_value=include_value
+        )
+
+        with open(output_path, 'w', encoding='utf-8') as f:
+            for conv in conversations:
+                json.dump(conv, f)
+                f.write('\n')
+
+    def process_sgfs_file_threaded(self,
+                                   sgfs_path: str,
+                                   output_dir: str,
+                                   max_games: Optional[int] = None,
+                                   num_threads: int = 4,
+                                   checkpoint_interval: int = 50,
+                                   resume_from_checkpoint: Optional[str] = None) -> List[GameData]:
+        """
+        Process an SGFS file with multiple threads for parallel evaluation.
+
+        Args:
+            sgfs_path: Path to the .sgfs file
+            output_dir: Directory to save conversation JSONL files
+            max_games: Optional limit on number of games to process
+            num_threads: Number of parallel worker threads for conversation generation
+            checkpoint_interval: Save checkpoint every N games
+            resume_from_checkpoint: Optional checkpoint file to resume from
+
+        Returns:
+            List of GameData objects
+        """
+        print(f"Step 1: Parsing SGFS file: {sgfs_path}")
+        games = parse_sgfs_file(sgfs_path)
+        print(f"Found {len(games)} games")
+
+        if max_games:
+            games = games[:max_games]
+            print(f"Processing first {max_games} games")
+
+        # Load checkpoint if resuming
+        processed_game_ids = set()
+        initial_results = []
+
+        if resume_from_checkpoint:
+            print(f"\nLoading checkpoint: {resume_from_checkpoint}")
+            try:
+                with open(resume_from_checkpoint, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        game_data_dict = json.loads(line)
+                        # Reconstruct GameData from dict
+                        game_data = GameData.from_dict(game_data_dict)
+                        initial_results.append(game_data)
+                        processed_game_ids.add(game_data.game_id)
+
+                print(f"Loaded {len(initial_results)} games from checkpoint")
+                print(f"Resuming from game {len(initial_results) + 1}")
+
+                # Filter out already processed games
+                games = [g for g in games if g.game_id not in processed_game_ids]
+                print(f"Remaining games to process: {len(games)}")
+
+            except FileNotFoundError:
+                print(f"Warning: Checkpoint file not found: {resume_from_checkpoint}")
+                print("Starting from beginning...")
+            except Exception as e:
+                print(f"Warning: Could not load checkpoint: {e}")
+                print("Starting from beginning...")
+
+        print(f"\nStep 2: Starting {num_threads} worker threads with neural network evaluators...")
+
+        # Results storage with thread-safe access
+        results = initial_results.copy()  # Start with checkpoint data
+        results_lock = Lock()
+        processed_count = [len(initial_results)]  # Start from checkpoint count
+        start_time = time.time()
+        total_games = len(games) + len(initial_results)
+
+        def process_game_worker(game_record, worker_id):
+            """Worker function to process a single game."""
+            try:
+                # Each worker gets its own evaluator instance
+                with KataHexEvaluator(
+                    katahex_path=self.katahex_path,
+                    model_path=self.model_path,
+                    config_path=self.config_path
+                ) as evaluator:
+                    processor = GameHistoryProcessor(evaluator)
+                    game_data = processor.process_game(game_record)
+
+                    # Thread-safe result storage
+                    with results_lock:
+                        results.append(game_data)
+                        processed_count[0] += 1
+                        count = processed_count[0]
+
+                        # Progress reporting
+                        if count % 10 == 0 or count == total_games:
+                            elapsed = time.time() - start_time
+                            rate = (count - len(initial_results)) / elapsed if elapsed > 0 else 0
+                            remaining = total_games - count
+                            eta = remaining / rate if rate > 0 else 0
+                            print(f"Progress: {count}/{total_games} games "
+                                  f"({count*100//total_games}%) - "
+                                  f"{rate:.1f} games/sec - "
+                                  f"ETA: {eta:.0f}s")
+
+                        # Checkpoint saving
+                        if checkpoint_interval > 0 and count % checkpoint_interval == 0:
+                            # Save checkpoint in output directory
+                            checkpoint_path = os.path.join(output_dir, f"checkpoint_{count}.jsonl")
+                            self._save_checkpoint(results.copy(), checkpoint_path)
+                            print(f"Checkpoint saved: {checkpoint_path}")
+
+                    return game_data
+
+            except Exception as e:
+                print(f"Error processing game (worker {worker_id}): {e}")
+                return None
+
+        # Process games in parallel
+        print(f"\nStep 3: Processing {len(games)} games with {num_threads} threads...")
+
+        with ThreadPoolExecutor(max_workers=num_threads) as executor:
+            # Submit all games to the thread pool
+            future_to_game = {
+                executor.submit(process_game_worker, game, i % num_threads): game
+                for i, game in enumerate(games)
+            }
+
+            # Wait for all to complete
+            for future in as_completed(future_to_game):
+                try:
+                    future.result()
+                except Exception as e:
+                    print(f"Worker thread error: {e}")
+
+        elapsed = time.time() - start_time
+        print(f"\nStep 4: Processing complete!")
+        print(f"Successfully processed {len(results)} games in {elapsed:.1f}s")
+        print(f"Average: {len(results)/elapsed:.2f} games/sec")
+
+        print(f"\nStep 5: Generating conversations and saving to {output_dir}")
+        self.save_conversations(results, output_dir, num_threads=num_threads)
+
+        return results
+
+
+def main():
+    """Main entry point for command-line usage."""
+    parser = argparse.ArgumentParser(
+        description="Process SGFS files with neural network evaluation",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Generate conversation data (default, 1 file per game to output dir)
+  python orchestrator.py --input games.sgfs --output conversations_dir
+
+  # Generate raw game data as JSONL
+  python orchestrator.py --input games.sgfs --output results.jsonl --format jsonl
+
+  # Multi-threaded processing with 4 threads
+  python orchestrator.py --input games.sgfs --threads 4
+
+  # Process only first 10 games
+  python orchestrator.py --input games.sgfs --max-games 10
+        """
+    )
+    
+    parser.add_argument('--input', '-i', required=True,
+                       help='Path to input .sgfs file')
+    parser.add_argument('--output', '-o',
+                       help='Path to output JSON file (default: input_name_processed.json)')
+    parser.add_argument('--katahex', default='build/katahex-win64-19-eigen.exe',
+                       help='Path to KataHex executable')
+    parser.add_argument('--model', default='katahex_model_20220618.bin.gz',
+                       help='Path to neural network model')
+    parser.add_argument('--config',
+                       help='Path to config file (optional)')
+    parser.add_argument('--max-games', type=int,
+                       help='Maximum number of games to process')
+    parser.add_argument('--threads', '-t', type=int, default=1,
+                       help='Number of parallel worker threads for conversation generation (default: 1)')
+    parser.add_argument('--checkpoint-interval', type=int, default=50,
+                       help='Save checkpoint every N games (default: 50, 0=disabled)')
+    parser.add_argument('--resume', '-r',
+                       help='Resume from checkpoint file (JSONL format)')
+
+    args = parser.parse_args()
+
+    # Determine output directory
+    if not args.output:
+        input_path = Path(args.input)
+        args.output = str(input_path.parent / f"{input_path.stem}_conversations")
+
+    # Create processor
+    processor = SGFSProcessor(
+        katahex_path=args.katahex,
+        model_path=args.model,
+        config_path=args.config
+    )
+
+    # Process file with multi-threaded batch processing
+    if args.threads > 1 or args.resume or args.checkpoint_interval > 0:
+        print(f"Using multi-threaded batch processing with {args.threads} conversation threads")
+        processor.process_sgfs_file_threaded(
+            sgfs_path=args.input,
+            output_dir=args.output,
+            max_games=args.max_games,
+            num_threads=args.threads,
+            checkpoint_interval=args.checkpoint_interval,
+            resume_from_checkpoint=args.resume
+        )
+    else:
+        print("Using single-threaded processing")
+        processor.process_sgfs_file(
+            sgfs_path=args.input,
+            output_dir=args.output,
+            max_games=args.max_games,
+            num_threads=args.threads
+        )
+
+
+if __name__ == '__main__':
+    main()
+
