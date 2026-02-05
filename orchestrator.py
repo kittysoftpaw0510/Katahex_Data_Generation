@@ -135,30 +135,63 @@ class SGFSProcessor:
         return games_processed
 
     def _process_multi_gpu(self, games: list, output_dir: str, num_threads: int, num_gpus: int) -> int:
-        """Process games in parallel using multiple GPUs."""
-        print(f"\nStep 2: Starting {num_gpus} GPU workers with {num_threads} threads...")
+        """
+        Process games in parallel using KataHex's built-in multi-GPU support.
+        Creates ONE KataHex process with internal GPU threads (thread-safe).
+        """
+        print(f"\nStep 2: Creating multi-GPU config and starting KataHex...")
         print(f"Mode: {'MCTS search (slow, high quality)' if self.use_mcts else 'Raw NN (fast)'}")
+        print(f"GPUs: {num_gpus}, Threads: {num_threads}")
 
         games_processed = 0
         games_lock = Lock()
         start_time = time.time()
 
-        def process_game_worker(game_idx_tuple):
-            """Worker function for parallel processing."""
-            idx, game = game_idx_tuple
-            gpu_id = idx % num_gpus  # Assign GPU based on game index
+        # Create temporary config file with multi-GPU settings
+        import tempfile
+        config_fd, temp_config_path = tempfile.mkstemp(suffix='.cfg', text=True)
 
-            try:
-                # Create evaluator with specific GPU
-                with KataHexEvaluator(
-                    katahex_path=self.katahex_path,
-                    model_path=self.model_path,
-                    config_path=self.config_path,
-                    use_mcts=self.use_mcts,
-                    gpu_id=gpu_id,
-                    max_visits=self.max_visits
-                ) as evaluator:
-                    processor = GameHistoryProcessor(evaluator)
+        try:
+            # Read base config
+            base_config_lines = []
+            if self.config_path and os.path.exists(self.config_path):
+                with open(self.config_path, 'r') as f:
+                    base_config_lines = f.readlines()
+
+            # Add multi-GPU configuration
+            with os.fdopen(config_fd, 'w') as f:
+                # Write base config
+                for line in base_config_lines:
+                    # Skip any existing GPU settings
+                    if not any(x in line for x in ['cudaGpuToUse', 'numNNServerThreads']):
+                        f.write(line)
+
+                # Add multi-GPU settings
+                f.write(f"\n# Multi-GPU Configuration (auto-generated)\n")
+                f.write(f"numNNServerThreadsPerModel = {num_gpus}\n")
+                for i in range(num_gpus):
+                    f.write(f"cudaGpuToUseModel0Thread{i} = {i}\n")
+
+            print(f"Created multi-GPU config: {temp_config_path}")
+
+            # Create ONE evaluator with built-in multi-GPU support
+            print(f"Starting KataHex with {num_gpus} internal GPU threads...")
+            evaluator = KataHexEvaluator(
+                katahex_path=self.katahex_path,
+                model_path=self.model_path,
+                config_path=temp_config_path,
+                use_mcts=self.use_mcts,
+                gpu_id=None,  # Don't override - use config file settings
+                max_visits=self.max_visits
+            )
+            evaluator.start()
+            print(f"KataHex ready with {num_gpus} GPUs")
+
+            processor = GameHistoryProcessor(evaluator)
+
+            def process_single_game(idx, game):
+                """Process a single game. KataHex handles GPU distribution internally."""
+                try:
                     game_data = processor.process_game(game)
 
                     # Save conversation (thread-safe)
@@ -168,41 +201,180 @@ class SGFSProcessor:
                         include_value=True
                     )
 
-                    # Update progress (thread-safe)
+                    # Update global progress (thread-safe)
                     nonlocal games_processed
                     with games_lock:
                         games_processed += 1
                         current_count = games_processed
 
-                    # Progress update
+                    # Progress update (every 10 games to reduce spam)
                     if current_count % 10 == 0 or current_count == len(games):
                         elapsed = time.time() - start_time
                         rate = current_count / elapsed if elapsed > 0 else 0
                         eta = (len(games) - current_count) / rate if rate > 0 else 0
                         print(f"Progress: {current_count}/{len(games)} games | "
                               f"Rate: {rate:.2f} games/sec | "
-                              f"ETA: {eta/60:.1f} min | "
-                              f"GPU {gpu_id}")
+                              f"ETA: {eta/60:.1f} min")
 
                     return True
 
-            except Exception as e:
-                print(f"Error processing game {idx} on GPU {gpu_id}: {e}")
-                return False
+                except Exception as e:
+                    print(f"Error processing game {idx}: {e}")
+                    return False
 
-        print(f"\nStep 3: Processing {len(games)} games in parallel across {num_gpus} GPUs...")
+            print(f"\nStep 3: Processing {len(games)} games with {num_threads} threads...")
 
-        # Process games in parallel
-        with ThreadPoolExecutor(max_workers=num_threads) as executor:
-            # Submit all games
-            futures = []
-            for idx, game in enumerate(games, 1):
-                future = executor.submit(process_game_worker, (idx, game))
-                futures.append(future)
+            # Process all games with thread pool
+            # KataHex's internal queue handles GPU distribution
+            with ThreadPoolExecutor(max_workers=num_threads) as executor:
+                futures = [executor.submit(process_single_game, idx, game)
+                          for idx, game in enumerate(games)]
 
-            # Wait for all to complete
-            for future in as_completed(futures):
-                future.result()  # This will raise any exceptions that occurred
+                # Wait for all to complete
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        print(f"Worker error: {e}")
+
+            # Cleanup
+            print(f"\nShutting down KataHex...")
+            evaluator.stop()
+
+        finally:
+            # Remove temporary config file
+            if os.path.exists(temp_config_path):
+                os.remove(temp_config_path)
+
+        print(f"\nProcessing complete!")
+        print(f"Successfully processed {games_processed} games")
+        print(f"Output directory: {output_dir}")
+
+        return games_processed
+
+    def _process_multi_gpu_with_file_mapping(self, games: list, output_dir: str, file_mapping: dict, num_threads: int, num_gpus: int) -> int:
+        """
+        Process games in parallel using KataHex's built-in multi-GPU support with file mapping.
+        Creates ONE KataHex process with internal GPU threads (thread-safe).
+
+        Args:
+            games: List of all games from all files
+            output_dir: Base output directory
+            file_mapping: Dict mapping game id to original filename (stem)
+            num_threads: Number of threads
+            num_gpus: Number of GPUs
+        """
+        print(f"\nStep 2: Creating multi-GPU config and starting KataHex...")
+        print(f"Mode: {'MCTS search (slow, high quality)' if self.use_mcts else 'Raw NN (fast)'}")
+        print(f"GPUs: {num_gpus}, Threads: {num_threads}")
+
+        games_processed = 0
+        games_lock = Lock()
+        start_time = time.time()
+
+        # Create temporary config file with multi-GPU settings
+        import tempfile
+        config_fd, temp_config_path = tempfile.mkstemp(suffix='.cfg', text=True)
+
+        try:
+            # Read base config
+            base_config_lines = []
+            if self.config_path and os.path.exists(self.config_path):
+                with open(self.config_path, 'r') as f:
+                    base_config_lines = f.readlines()
+
+            # Add multi-GPU configuration
+            with os.fdopen(config_fd, 'w') as f:
+                # Write base config
+                for line in base_config_lines:
+                    # Skip any existing GPU settings
+                    if not any(x in line for x in ['cudaGpuToUse', 'numNNServerThreads']):
+                        f.write(line)
+
+                # Add multi-GPU settings
+                f.write(f"\n# Multi-GPU Configuration (auto-generated)\n")
+                f.write(f"numNNServerThreadsPerModel = {num_gpus}\n")
+                for i in range(num_gpus):
+                    f.write(f"cudaGpuToUseModel0Thread{i} = {i}\n")
+
+            print(f"Created multi-GPU config: {temp_config_path}")
+
+            # Create ONE evaluator with built-in multi-GPU support
+            print(f"Starting KataHex with {num_gpus} internal GPU threads...")
+            evaluator = KataHexEvaluator(
+                katahex_path=self.katahex_path,
+                model_path=self.model_path,
+                config_path=temp_config_path,
+                use_mcts=self.use_mcts,
+                gpu_id=None,  # Don't override - use config file settings
+                max_visits=self.max_visits
+            )
+            evaluator.start()
+            print(f"KataHex ready with {num_gpus} GPUs")
+
+            processor = GameHistoryProcessor(evaluator)
+
+            def process_single_game(idx, game):
+                """Process a single game. KataHex handles GPU distribution internally."""
+                try:
+                    game_data = processor.process_game(game)
+
+                    # Determine output subdirectory based on original file
+                    file_stem = file_mapping.get(id(game), "unknown")
+                    file_output_dir = os.path.join(output_dir, file_stem)
+                    os.makedirs(file_output_dir, exist_ok=True)
+
+                    # Save conversation (thread-safe)
+                    self._save_single_conversation(
+                        game_data, file_output_dir,
+                        include_policy=True,
+                        include_value=True
+                    )
+
+                    # Update global progress (thread-safe)
+                    nonlocal games_processed
+                    with games_lock:
+                        games_processed += 1
+                        current_count = games_processed
+
+                    # Progress update (every 10 games to reduce spam)
+                    if current_count % 10 == 0 or current_count == len(games):
+                        elapsed = time.time() - start_time
+                        rate = current_count / elapsed if elapsed > 0 else 0
+                        eta = (len(games) - current_count) / rate if rate > 0 else 0
+                        print(f"Progress: {current_count}/{len(games)} games | "
+                              f"Rate: {rate:.2f} games/sec | "
+                              f"ETA: {eta/60:.1f} min")
+
+                    return True
+
+                except Exception as e:
+                    print(f"Error processing game {idx}: {e}")
+                    return False
+
+            print(f"\nStep 3: Processing {len(games)} games with {num_threads} threads...")
+
+            # Process all games with thread pool
+            # KataHex's internal queue handles GPU distribution
+            with ThreadPoolExecutor(max_workers=num_threads) as executor:
+                futures = [executor.submit(process_single_game, idx, game)
+                          for idx, game in enumerate(games)]
+
+                # Wait for all to complete
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        print(f"Worker error: {e}")
+
+            # Cleanup
+            print(f"\nShutting down KataHex...")
+            evaluator.stop()
+
+        finally:
+            # Remove temporary config file
+            if os.path.exists(temp_config_path):
+                os.remove(temp_config_path)
 
         print(f"\nProcessing complete!")
         print(f"Successfully processed {games_processed} games")

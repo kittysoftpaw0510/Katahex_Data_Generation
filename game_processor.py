@@ -81,27 +81,28 @@ class GameHistoryProcessor:
     def process_game(self, game: GameRecord) -> GameData:
         """
         Process a complete game, evaluating each position.
-        
+
         Args:
             game: GameRecord from SGF parser
-            
+
         Returns:
             GameData with all step evaluations
         """
-        steps = []
-        
         # Track board state
         black_stones = list(game.initial_stones.get('AB', []))
         white_stones = list(game.initial_stones.get('AW', []))
         move_history = []
-        
+
         # Determine starting player
         if black_stones and not white_stones:
             next_player = 'W'
         else:
             next_player = 'B'
-        
-        # Process each move
+
+        # STEP 1: Collect all board states for batch evaluation
+        board_states = []
+        move_data = []  # Store move info for later
+
         for move_num, move in enumerate(game.moves, 1):
             # Create board state before this move
             board_state = BoardState(
@@ -111,43 +112,52 @@ class GameHistoryProcessor:
                 next_player=move.player,
                 move_history=move_history.copy()
             )
-            
-            # Evaluate position
-            evaluation = self.evaluator.evaluate(board_state)
-            
-            # Parse original comment if available
-            original_comment = move.parse_comment()
-            
-            # Create step data
-            step = StepData(
-                move_number=move_num,
-                player=move.player,
-                move_location=move.location,
-                board_size=game.board_size,
-                black_stones=black_stones.copy(),
-                white_stones=white_stones.copy(),
-                next_player=move.player,
-                policy=evaluation.policy,
-                value=evaluation.value,
-                win_prob=evaluation.win_prob,
-                loss_prob=evaluation.loss_prob,
-                draw_prob=evaluation.draw_prob,
-                original_comment=original_comment
-            )
-            
-            steps.append(step)
-            
+
+            board_states.append(board_state)
+
+            # Store move info for later
+            move_data.append({
+                'move_num': move_num,
+                'move': move,
+                'black_stones': black_stones.copy(),
+                'white_stones': white_stones.copy(),
+                'original_comment': move.parse_comment()
+            })
+
             # Update board state with the move
             if move.location != 'pass':
                 if move.player == 'B':
                     black_stones.append(move.location)
                 else:
                     white_stones.append(move.location)
-            
+
             move_history.append((move.player, move.location))
-            
+
             # Update next player
             next_player = 'W' if move.player == 'B' else 'B'
+
+        # STEP 2: Batch evaluate all positions at once (MAXIMUM GPU UTILIZATION!)
+        evaluations = self.evaluator.evaluate_batch(board_states)
+
+        # STEP 3: Create step data from evaluations
+        steps = []
+        for i, (data, evaluation) in enumerate(zip(move_data, evaluations)):
+            step = StepData(
+                move_number=data['move_num'],
+                player=data['move'].player,
+                move_location=data['move'].location,
+                board_size=game.board_size,
+                black_stones=data['black_stones'],
+                white_stones=data['white_stones'],
+                next_player=data['move'].player,
+                policy=evaluation.policy,
+                value=evaluation.value,
+                win_prob=evaluation.win_prob,
+                loss_prob=evaluation.loss_prob,
+                draw_prob=evaluation.draw_prob,
+                original_comment=data['original_comment']
+            )
+            steps.append(step)
         
         # Create game metadata
         # Generate unique game ID from metadata

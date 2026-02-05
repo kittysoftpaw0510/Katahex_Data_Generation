@@ -10,6 +10,9 @@ import tempfile
 import os
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple
+from threading import Lock, Event
+from queue import Queue
+import time as time_module
 import numpy as np
 
 
@@ -63,6 +66,8 @@ class KataHexEvaluator:
         self.gpu_id = gpu_id
         self.max_visits = max_visits
         self.process = None
+        self._io_lock = Lock()  # For thread-safe batch operations
+        self._query_counter = 0  # Unique ID for each query
         
     def start(self):
         """Start the KataHex engine."""
@@ -78,13 +83,12 @@ class KataHexEvaluator:
         if self.model_path:
             cmd.extend(["-model", self.model_path])
 
-        # GPU selection via command-line override
-        # This overrides the config file settings
+        # GPU selection via environment variable (most reliable method)
+        # CUDA_VISIBLE_DEVICES forces the process to only see specific GPU(s)
+        env = os.environ.copy()
         if self.gpu_id is not None:
-            # For CUDA backend
-            cmd.extend(["-override-config", f"cudaDeviceToUse={self.gpu_id}"])
-            # For OpenCL backend
-            cmd.extend(["-override-config", f"openclDeviceToUse={self.gpu_id}"])
+            # Set CUDA_VISIBLE_DEVICES to make only this GPU visible
+            env['CUDA_VISIBLE_DEVICES'] = str(self.gpu_id)
 
         # Use universal_newlines=True for text mode
         self.process = subprocess.Popen(
@@ -94,7 +98,8 @@ class KataHexEvaluator:
             stderr=subprocess.PIPE,
             universal_newlines=True,
             bufsize=1,
-            encoding='utf-8'
+            encoding='utf-8',
+            env=env  # Pass modified environment with CUDA_VISIBLE_DEVICES
         )
 
         # Check if process started
@@ -129,46 +134,48 @@ class KataHexEvaluator:
             raise RuntimeError("Engine not started. Call start() first.")
 
         try:
-            # Send command
-            self.process.stdin.write(command + "\n")
-            self.process.stdin.flush()
+            # CRITICAL: Lock I/O to prevent race conditions from multiple threads
+            with self._io_lock:
+                # Send command
+                self.process.stdin.write(command + "\n")
+                self.process.stdin.flush()
 
-            # Read response until we get a blank line
-            response_lines = []
-            success = False
-            error = False
+                # Read response until we get a blank line
+                response_lines = []
+                success = False
+                error = False
 
-            while True:
-                line = self.process.stdout.readline()
-                if not line:  # EOF
-                    break
-
-                line = line.strip()
-
-                if not line:  # Empty line marks end of response
-                    if success or error:
+                while True:
+                    line = self.process.stdout.readline()
+                    if not line:  # EOF
                         break
-                    continue
 
-                if line.startswith('='):
-                    success = True
-                    # Remove the '=' and any ID
-                    content = line[1:].strip()
-                    if content:
-                        response_lines.append(content)
-                elif line.startswith('?'):
-                    error = True
-                    # Remove the '?' and any ID
-                    content = line[1:].strip()
-                    if content:
-                        response_lines.append(content)
-                else:
-                    response_lines.append(line)
+                    line = line.strip()
 
-            if error:
-                raise RuntimeError(f"GTP command failed: {command}\nResponse: {' '.join(response_lines)}")
+                    if not line:  # Empty line marks end of response
+                        if success or error:
+                            break
+                        continue
 
-            return '\n'.join(response_lines)
+                    if line.startswith('='):
+                        success = True
+                        # Remove the '=' and any ID
+                        content = line[1:].strip()
+                        if content:
+                            response_lines.append(content)
+                    elif line.startswith('?'):
+                        error = True
+                        # Remove the '?' and any ID
+                        content = line[1:].strip()
+                        if content:
+                            response_lines.append(content)
+                    else:
+                        response_lines.append(line)
+
+                if error:
+                    raise RuntimeError(f"GTP command failed: {command}\nResponse: {' '.join(response_lines)}")
+
+                return '\n'.join(response_lines)
 
         except Exception as e:
             raise RuntimeError(f"Error sending command '{command}': {e}")
@@ -370,103 +377,128 @@ class KataHexEvaluator:
             draw_prob=draw_prob
         )
 
-    def _evaluate_with_mcts(self, board_state: BoardState) -> NNEvaluation:
-        """High-quality evaluation using MCTS search (slow) via JSON analysis mode."""
+    def evaluate_batch(self, board_states: List[BoardState]) -> List[NNEvaluation]:
+        """
+        Evaluate multiple positions in a batch for maximum GPU utilization.
+        This is the PROPER way to use KataHex with multiple threads.
+        """
         import json
 
-        # Build move history in the format KataHex expects
-        # move_history is a list of tuples: [(player, location), ...]
-        moves = []
-        for move in board_state.move_history:
-            # move is a tuple (player, location)
-            player, location = move
-            player_str = "B" if player == 'B' else "W"
-            moves.append([player_str, location])
+        if not board_states:
+            return []
 
-        # Create analysis query
-        # Use "tromp-taylor" rules which is the standard for Hex
-        query = {
-            "id": "eval",
-            "moves": moves,
-            "rules": "tromp-taylor",
-            "boardXSize": board_state.board_size,
-            "boardYSize": board_state.board_size,
-            "analyzeTurns": [len(moves)],  # Analyze current position
-            "maxVisits": self.max_visits,  # Number of MCTS visits
-            "includePolicy": True,  # Request policy information
-        }
-
-        # DEBUG: Print query
-        # print(f"DEBUG: Sending query: {json.dumps(query)[:200]}...")
-
-        # Send query
-        self.process.stdin.write(json.dumps(query) + "\n")
-        self.process.stdin.flush()
-
-        # print("DEBUG: Waiting for response...")
-
-        # Read response with timeout
-        import select
-        import sys
-
-        # Wait up to 30 seconds for response
-        if sys.platform == 'win32':
-            # Windows doesn't support select on pipes, just read with timeout
-            response_line = self.process.stdout.readline()
+        # Use MCTS or raw NN based on configuration
+        if self.use_mcts:
+            return self._evaluate_batch_mcts(board_states)
         else:
-            # Unix-like systems can use select
-            ready, _, _ = select.select([self.process.stdout], [], [], 30.0)
-            if not ready:
-                raise RuntimeError("Timeout waiting for KataHex analysis response")
-            response_line = self.process.stdout.readline()
+            return self._evaluate_batch_raw_nn(board_states)
 
-        if not response_line:
-            raise RuntimeError("No response from KataHex analysis engine")
+    def _evaluate_batch_mcts(self, board_states: List[BoardState]) -> List[NNEvaluation]:
+        """Batch evaluation using MCTS via analysis mode."""
+        import json
 
-        # print(f"DEBUG: Got response: {response_line[:200]}...")
+        # Build queries for all positions
+        queries = []
+        for idx, board_state in enumerate(board_states):
+            moves = []
+            for move in board_state.move_history:
+                player, location = move
+                player_str = "B" if player == 'B' else "W"
+                moves.append([player_str, location])
 
-        response = json.loads(response_line)
+            query = {
+                "id": f"batch_{idx}",  # Unique ID for each query
+                "moves": moves,
+                "rules": "tromp-taylor",
+                "boardXSize": board_state.board_size,
+                "boardYSize": board_state.board_size,
+                "analyzeTurns": [len(moves)],
+                "maxVisits": self.max_visits,
+                "includePolicy": True,
+            }
+            queries.append(query)
 
-        # DEBUG: Print response structure
-        # print(f"DEBUG: Response keys: {response.keys()}")
-        # if 'moveInfos' in response:
-        #     print(f"DEBUG: Number of moveInfos: {len(response['moveInfos'])}")
-        #     if response['moveInfos']:
-        #         print(f"DEBUG: First moveInfo keys: {response['moveInfos'][0].keys()}")
-        #         print(f"DEBUG: First moveInfo: {response['moveInfos'][0]}")
+        # Send all queries at once, then read all responses
+        with self._io_lock:
+            # Send all queries (non-blocking writes)
+            for query in queries:
+                self.process.stdin.write(json.dumps(query) + "\n")
+            self.process.stdin.flush()
 
+            # Read all responses
+            responses = {}
+            for _ in range(len(queries)):
+                response_line = self.process.stdout.readline()
+                if not response_line:
+                    raise RuntimeError("No response from KataHex")
+                response = json.loads(response_line)
+                responses[response["id"]] = response
+
+        # Parse responses in order
+        results = []
+        for idx, board_state in enumerate(board_states):
+            response = responses[f"batch_{idx}"]
+            result = self._parse_analysis_response(response, board_state)
+            results.append(result)
+
+        return results
+
+    def _evaluate_batch_raw_nn(self, board_states: List[BoardState]) -> List[NNEvaluation]:
+        """Batch evaluation using raw NN via GTP mode."""
+        # For raw NN, we still need to evaluate one by one in GTP mode
+        # But we can send multiple commands before reading responses
+        results = []
+        for board_state in board_states:
+            result = self._evaluate_with_raw_nn(board_state)
+            results.append(result)
+        return results
+
+    def _evaluate_with_mcts(self, board_state: BoardState) -> NNEvaluation:
+        """High-quality evaluation using MCTS search (slow) via JSON analysis mode."""
+        # Use batch evaluation with single item for consistency
+        return self.evaluate_batch([board_state])[0]
+
+    def _parse_analysis_response(self, response: dict, board_state: BoardState) -> NNEvaluation:
+        """Parse KataHex analysis response into NNEvaluation."""
         # Extract policy and value from response
         policy = {}
         win_prob = 0.5
         loss_prob = 0.5
         draw_prob = 0.0
 
-        # Parse moveInfos for policy
-        if 'moveInfos' in response:
+        # Extract policy from moveInfos
+        if 'moveInfos' in response and response['moveInfos']:
             for move_info in response['moveInfos']:
-                move = move_info.get('move', '').lower()
+                move_str = move_info['move']
                 prior = move_info.get('prior', 0.0)
-                if move and move != 'pass':
-                    policy[move] = prior
+                policy[move_str] = prior
 
-        # Parse rootInfo for value
+        # Extract value from rootInfo
         if 'rootInfo' in response:
             root_info = response['rootInfo']
             current_player_winrate = root_info.get('winrate', 0.5)
 
-            # Convert to White's perspective for consistency
+            # KataHex returns winrate from the perspective of the player to move
+            # board_state.next_player is the player about to move (current player)
+            # We store win_prob/loss_prob from White's perspective for consistency
+
             if board_state.next_player == 'B':
-                win_prob = 1.0 - current_player_winrate
-                loss_prob = current_player_winrate
+                # Black to move, so current_player_winrate is Black's winrate
+                win_prob = 1.0 - current_player_winrate  # White's win prob
+                loss_prob = current_player_winrate        # White's loss prob (= Black's win prob)
             else:
+                # White to move, so current_player_winrate is White's winrate
                 win_prob = current_player_winrate
                 loss_prob = 1.0 - current_player_winrate
 
-        # Calculate value from current player's perspective
+        # Calculate value from the perspective of the player to move
+        # value should be positive if the current player is winning
         if board_state.next_player == 'B':
-            value = loss_prob - win_prob  # Black's perspective
+            # Black to move: value = Black's advantage = -White's advantage
+            value = loss_prob - win_prob
         else:
-            value = win_prob - loss_prob  # White's perspective
+            # White to move: value = White's advantage
+            value = win_prob - loss_prob
 
         return NNEvaluation(
             policy=policy,
@@ -475,6 +507,7 @@ class KataHexEvaluator:
             loss_prob=loss_prob,
             draw_prob=draw_prob
         )
+
     
     def __enter__(self):
         """Context manager entry."""
