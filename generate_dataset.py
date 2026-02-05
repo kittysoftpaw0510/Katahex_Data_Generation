@@ -65,6 +65,8 @@ python generate_dataset.py \
                        help='Number of GPUs to use for parallel processing (default: 1)')
     parser.add_argument('--use-mcts', action='store_true',
                        help='Use MCTS search for evaluation (slow but high quality). Default: raw NN (fast)')
+    parser.add_argument('--max-visits', type=int, default=1600,
+                       help='Maximum number of MCTS visits (only used with --use-mcts, default: 1600)')
 
     args = parser.parse_args()
 
@@ -95,7 +97,8 @@ python generate_dataset.py \
         katahex_path=args.katahex,
         model_path=args.model,
         config_path=args.config,
-        use_mcts=args.use_mcts
+        use_mcts=args.use_mcts,
+        max_visits=args.max_visits
     )
 
     print(f"Evaluation mode: {'MCTS search (slow, high quality)' if args.use_mcts else 'Raw NN (fast)'}")

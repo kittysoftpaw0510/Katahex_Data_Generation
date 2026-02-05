@@ -27,7 +27,8 @@ class SGFSProcessor:
                  katahex_path: str = "build/katahex-win64-19-eigen.exe",
                  model_path: str = "katahex_model_20220618.bin.gz",
                  config_path: Optional[str] = None,
-                 use_mcts: bool = False):
+                 use_mcts: bool = False,
+                 max_visits: int = 1600):
         """
         Initialize the processor.
 
@@ -36,11 +37,13 @@ class SGFSProcessor:
             model_path: Path to neural network model
             config_path: Optional path to config file
             use_mcts: If True, use MCTS search (slow, high quality). If False, use raw NN (fast)
+            max_visits: Maximum number of MCTS visits (only used when use_mcts=True)
         """
         self.katahex_path = katahex_path
         self.model_path = model_path
         self.config_path = config_path
         self.use_mcts = use_mcts
+        self.max_visits = max_visits
     
     def process_sgfs_file(self,
                          sgfs_path: str,
@@ -152,7 +155,8 @@ class SGFSProcessor:
                     model_path=self.model_path,
                     config_path=self.config_path,
                     use_mcts=self.use_mcts,
-                    gpu_id=gpu_id
+                    gpu_id=gpu_id,
+                    max_visits=self.max_visits
                 ) as evaluator:
                     processor = GameHistoryProcessor(evaluator)
                     game_data = processor.process_game(game)

@@ -43,7 +43,8 @@ class KataHexEvaluator:
                  model_path: str = "katahex_model_20220618.bin.gz",
                  config_path: Optional[str] = None,
                  use_mcts: bool = False,
-                 gpu_id: Optional[int] = None):
+                 gpu_id: Optional[int] = None,
+                 max_visits: int = 1600):
         """
         Initialize the evaluator.
 
@@ -53,17 +54,23 @@ class KataHexEvaluator:
             config_path: Optional path to config file
             use_mcts: If True, use kata-analyze (slow, high quality). If False, use kata-raw-nn (fast, raw NN)
             gpu_id: Optional GPU ID to use (for multi-GPU setups)
+            max_visits: Maximum number of MCTS visits (only used when use_mcts=True)
         """
         self.katahex_path = katahex_path
         self.model_path = model_path
         self.config_path = config_path
         self.use_mcts = use_mcts
         self.gpu_id = gpu_id
+        self.max_visits = max_visits
         self.process = None
         
     def start(self):
-        """Start the KataHex GTP engine."""
-        cmd = [self.katahex_path, "gtp"]
+        """Start the KataHex engine."""
+        # Use 'analysis' mode for MCTS, 'gtp' mode for raw NN
+        if self.use_mcts:
+            cmd = [self.katahex_path, "analysis"]
+        else:
+            cmd = [self.katahex_path, "gtp"]
 
         # Both config and model can be specified
         if self.config_path:
@@ -92,24 +99,24 @@ class KataHexEvaluator:
 
         # Check if process started
         import time
-        time.sleep(1.0)
+        time.sleep(0.5)
 
         if self.process.poll() is not None:
             # Process has already terminated
             stderr_output = self.process.stderr.read()
             raise RuntimeError(f"KataHex process terminated immediately. Error: {stderr_output}")
-
-        # Test connection
-        try:
-            response = self._send_command("name")
-        except Exception as e:
-            raise RuntimeError(f"Could not connect to KataHex engine: {e}")
         
     def stop(self):
         """Stop the KataHex engine."""
         if self.process:
             try:
-                self._send_command("quit")
+                if self.use_mcts:
+                    # Analysis mode: close stdin to signal end of input
+                    self.process.stdin.close()
+                else:
+                    # GTP mode: send quit command
+                    self.process.stdin.write("quit\n")
+                    self.process.stdin.flush()
                 self.process.wait(timeout=5)
             except:
                 self.process.kill()
@@ -165,7 +172,91 @@ class KataHexEvaluator:
 
         except Exception as e:
             raise RuntimeError(f"Error sending command '{command}': {e}")
-    
+
+    def _send_command_analyze(self, command: str, timeout: float = 30.0) -> str:
+        """
+        Send kata-analyze command and get response.
+        kata-analyze is a continuous command that:
+        1. Prints "=" immediately
+        2. Starts analysis and outputs "info" lines periodically
+        3. Continues until stopped by sending an empty line
+
+        We'll wait for analysis to complete (based on maxVisits from config),
+        collect the info lines, then stop the analysis.
+        """
+        if not self.process:
+            raise RuntimeError("Engine not started. Call start() first.")
+
+        try:
+            import time
+
+            # Send command
+            self.process.stdin.write(command + "\n")
+            self.process.stdin.flush()
+
+            # Read response
+            response_lines = []
+            start_time = time.time()
+            got_first_info = False
+
+            while True:
+                # Check timeout
+                elapsed = time.time() - start_time
+                if elapsed > timeout:
+                    # Stop analysis by sending empty line
+                    self.process.stdin.write("\n")
+                    self.process.stdin.flush()
+                    time.sleep(0.2)  # Give it time to stop
+                    break
+
+                # Read line (this will block until data is available)
+                line = self.process.stdout.readline()
+                if not line:  # EOF
+                    break
+
+                line = line.strip()
+
+                # First line should be "="
+                if line.startswith('='):
+                    continue
+
+                # Empty line means analysis stopped
+                if not line:
+                    if response_lines:  # We have data, we're done
+                        break
+                    continue
+
+                # Check if this is an error
+                if line.startswith('?'):
+                    error_msg = line[1:].strip()
+                    raise RuntimeError(f"GTP command failed: {command}\nResponse: {error_msg}")
+
+                # Collect info lines
+                if line.startswith('info'):
+                    response_lines.append(line)
+                    if not got_first_info:
+                        got_first_info = True
+
+                    # After we get enough info lines, wait a bit more then stop
+                    # This ensures we get the final analysis after search completes
+                    if len(response_lines) >= 10 and elapsed > 5.0:
+                        # Stop analysis by sending empty line
+                        self.process.stdin.write("\n")
+                        self.process.stdin.flush()
+                        # Continue reading until we get the empty line
+                        continue
+
+            return '\n'.join(response_lines)
+
+        except Exception as e:
+            # Make sure to stop analysis on error
+            try:
+                self.process.stdin.write("\n")
+                self.process.stdin.flush()
+            except:
+                pass
+            raise RuntimeError(f"Error sending command '{command}': {e}")
+
     def set_board_size(self, size: int):
         """Set the board size."""
         self._send_command(f"boardsize {size}")
@@ -208,12 +299,12 @@ class KataHexEvaluator:
         Returns:
             NNEvaluation with policy and value
         """
-        # Set up the position
-        self.set_position(board_state)
-
         if self.use_mcts:
+            # Analysis mode: send position via JSON, no GTP commands needed
             return self._evaluate_with_mcts(board_state)
         else:
+            # GTP mode: set up position using GTP commands, then evaluate
+            self.set_position(board_state)
             return self._evaluate_raw_nn(board_state)
 
     def _evaluate_raw_nn(self, board_state: BoardState) -> NNEvaluation:
@@ -280,64 +371,96 @@ class KataHexEvaluator:
         )
 
     def _evaluate_with_mcts(self, board_state: BoardState) -> NNEvaluation:
-        """High-quality evaluation using MCTS search (slow)."""
-        # Use kata-analyze to get MCTS-refined evaluation
-        # This respects the maxVisits setting in the config file
-        response = self._send_command("kata-analyze maxmoves 361")
+        """High-quality evaluation using MCTS search (slow) via JSON analysis mode."""
+        import json
 
+        # Build move history in the format KataHex expects
+        # move_history is a list of tuples: [(player, location), ...]
+        moves = []
+        for move in board_state.move_history:
+            # move is a tuple (player, location)
+            player, location = move
+            player_str = "B" if player == 'B' else "W"
+            moves.append([player_str, location])
+
+        # Create analysis query
+        # Use "tromp-taylor" rules which is the standard for Hex
+        query = {
+            "id": "eval",
+            "moves": moves,
+            "rules": "tromp-taylor",
+            "boardXSize": board_state.board_size,
+            "boardYSize": board_state.board_size,
+            "analyzeTurns": [len(moves)],  # Analyze current position
+            "maxVisits": self.max_visits,  # Number of MCTS visits
+            "includePolicy": True,  # Request policy information
+        }
+
+        # DEBUG: Print query
+        # print(f"DEBUG: Sending query: {json.dumps(query)[:200]}...")
+
+        # Send query
+        self.process.stdin.write(json.dumps(query) + "\n")
+        self.process.stdin.flush()
+
+        # print("DEBUG: Waiting for response...")
+
+        # Read response with timeout
+        import select
+        import sys
+
+        # Wait up to 30 seconds for response
+        if sys.platform == 'win32':
+            # Windows doesn't support select on pipes, just read with timeout
+            response_line = self.process.stdout.readline()
+        else:
+            # Unix-like systems can use select
+            ready, _, _ = select.select([self.process.stdout], [], [], 30.0)
+            if not ready:
+                raise RuntimeError("Timeout waiting for KataHex analysis response")
+            response_line = self.process.stdout.readline()
+
+        if not response_line:
+            raise RuntimeError("No response from KataHex analysis engine")
+
+        # print(f"DEBUG: Got response: {response_line[:200]}...")
+
+        response = json.loads(response_line)
+
+        # DEBUG: Print response structure
+        # print(f"DEBUG: Response keys: {response.keys()}")
+        # if 'moveInfos' in response:
+        #     print(f"DEBUG: Number of moveInfos: {len(response['moveInfos'])}")
+        #     if response['moveInfos']:
+        #         print(f"DEBUG: First moveInfo keys: {response['moveInfos'][0].keys()}")
+        #         print(f"DEBUG: First moveInfo: {response['moveInfos'][0]}")
+
+        # Extract policy and value from response
         policy = {}
         win_prob = 0.5
         loss_prob = 0.5
         draw_prob = 0.0
 
-        lines = response.strip().split('\n')
+        # Parse moveInfos for policy
+        if 'moveInfos' in response:
+            for move_info in response['moveInfos']:
+                move = move_info.get('move', '').lower()
+                prior = move_info.get('prior', 0.0)
+                if move and move != 'pass':
+                    policy[move] = prior
 
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
+        # Parse rootInfo for value
+        if 'rootInfo' in response:
+            root_info = response['rootInfo']
+            current_player_winrate = root_info.get('winrate', 0.5)
 
-            parts = line.split()
-            if len(parts) < 2:
-                continue
-
-            # Parse move information
-            if parts[0] == 'info' and parts[1] == 'move':
-                move = None
-                prior = 0.0
-
-                i = 2
-                while i < len(parts):
-                    if parts[i] == 'prior' and i + 1 < len(parts):
-                        prior = float(parts[i + 1])
-                        i += 2
-                    elif move is None:
-                        move = parts[i]
-                        i += 1
-                    else:
-                        i += 1
-
-                if move and move.lower() != 'pass':
-                    policy[move.lower()] = prior
-
-            # Parse root information for overall winrate
-            elif parts[0] == 'rootInfo':
-                i = 1
-                while i < len(parts):
-                    if parts[i] == 'winrate' and i + 1 < len(parts):
-                        current_player_winrate = float(parts[i + 1])
-
-                        # Convert to White's perspective for consistency
-                        if board_state.next_player == 'B':
-                            win_prob = 1.0 - current_player_winrate
-                            loss_prob = current_player_winrate
-                        else:
-                            win_prob = current_player_winrate
-                            loss_prob = 1.0 - current_player_winrate
-
-                        i += 2
-                    else:
-                        i += 1
+            # Convert to White's perspective for consistency
+            if board_state.next_player == 'B':
+                win_prob = 1.0 - current_player_winrate
+                loss_prob = current_player_winrate
+            else:
+                win_prob = current_player_winrate
+                loss_prob = 1.0 - current_player_winrate
 
         # Calculate value from current player's perspective
         if board_state.next_player == 'B':
