@@ -150,10 +150,14 @@ class GameHistoryProcessor:
             next_player = 'W' if move.player == 'B' else 'B'
         
         # Create game metadata
-        # Generate unique game ID from metadata
-        import hashlib
-        game_id_str = f"{game.black_player}_{game.white_player}_{game.result}_{len(game.moves)}"
-        game_id = hashlib.md5(game_id_str.encode()).hexdigest()[:16]
+        # Use gameHash from SGF if available, otherwise generate one
+        if 'gameHash' in game.metadata:
+            game_id = game.metadata['gameHash']
+        else:
+            # Fallback: generate hash from game content
+            import hashlib
+            game_id_str = f"{game.black_player}_{game.white_player}_{game.result}_{len(game.moves)}"
+            game_id = hashlib.md5(game_id_str.encode()).hexdigest()[:16]
 
         metadata = {
             'game_id': game_id,

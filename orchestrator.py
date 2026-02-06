@@ -100,18 +100,31 @@ class SGFSProcessor:
                     break  # Queue is empty, worker is done
 
                 try:
+                    # Skip games with no moves
+                    if not game.moves:
+                        stats_dict['errors'] = stats_dict.get('errors', 0) + 1
+                        stats_dict['skipped_no_moves'] = stats_dict.get('skipped_no_moves', 0) + 1
+                        continue
+
                     # Process game
                     game_data = processor.process_game(game)
 
-                    # Save conversation
-                    game_id = game_data.game_id or f"game_{id(game_data)}"
-                    output_path = os.path.join(output_dir, f"{game_id}.jsonl")
-
+                    # Generate conversations
                     conversations = generate_conversation_from_game(
                         game_data,
                         include_policy=True,
                         include_value=True
                     )
+
+                    # Skip if no valid conversations generated
+                    if not conversations:
+                        stats_dict['errors'] = stats_dict.get('errors', 0) + 1
+                        stats_dict['skipped_no_conversations'] = stats_dict.get('skipped_no_conversations', 0) + 1
+                        continue
+
+                    # Save conversation
+                    game_id = game_data.game_id or f"game_{id(game_data)}"
+                    output_path = os.path.join(output_dir, f"{game_id}.jsonl")
 
                     with open(output_path, 'w', encoding='utf-8') as f:
                         for conv in conversations:
@@ -137,6 +150,7 @@ class SGFSProcessor:
                 except Exception as e:
                     print(f"Error processing game {idx} on worker {worker_id}: {e}")
                     stats_dict['errors'] = stats_dict.get('errors', 0) + 1
+                    stats_dict['skipped_exceptions'] = stats_dict.get('skipped_exceptions', 0) + 1
 
         finally:
             # Cleanup evaluator when worker is done
@@ -190,6 +204,9 @@ class SGFSProcessor:
         stats_dict = manager.dict()
         stats_dict['processed'] = 0
         stats_dict['errors'] = 0
+        stats_dict['skipped_no_moves'] = 0
+        stats_dict['skipped_no_conversations'] = 0
+        stats_dict['skipped_exceptions'] = 0
         stats_dict['total'] = len(games)
         start_time = time.time()
 
@@ -213,12 +230,19 @@ class SGFSProcessor:
 
         # Step 4: Report results
         elapsed = time.time() - start_time
-        print(f"\nProcessing complete!")
-        print(f"Successfully processed: {stats_dict['processed']} games")
-        print(f"Errors: {stats_dict['errors']} games")
-        print(f"Total time: {elapsed:.1f}s")
+        print(f"\n{'='*60}")
+        print(f"Processing complete!")
+        print(f"{'='*60}")
+        print(f"Successfully processed: {stats_dict['processed']} games ({stats_dict['processed']*100//stats_dict['total']}%)")
+        print(f"Total errors/skipped: {stats_dict['errors']} games ({stats_dict['errors']*100//stats_dict['total']}%)")
+        print(f"\nError breakdown:")
+        print(f"  - Games with no moves: {stats_dict.get('skipped_no_moves', 0)}")
+        print(f"  - Games with no valid conversations: {stats_dict.get('skipped_no_conversations', 0)}")
+        print(f"  - Games with exceptions: {stats_dict.get('skipped_exceptions', 0)}")
+        print(f"\nTotal time: {elapsed:.1f}s")
         print(f"Average rate: {stats_dict['processed']/elapsed:.2f} games/sec")
         print(f"Output directory: {output_dir}")
+        print(f"{'='*60}")
 
         return stats_dict['processed']
 
